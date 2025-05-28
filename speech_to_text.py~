@@ -1,0 +1,238 @@
+# Hybrid Scam Detection with Real-Time Voice Input and Gemini Trigger (Improved Risk Logic)
+
+import os
+import threading
+import azure.cognitiveservices.speech as speechsdk
+from azure.ai.textanalytics import (
+    AnalyzeSentimentAction,
+    RecognizeEntitiesAction,
+    ExtractKeyPhrasesAction,
+    TextAnalyticsClient
+)
+from azure.core.credentials import AzureKeyCredential
+from dotenv import load_dotenv
+from datetime import datetime
+import google.generativeai as genai
+import re
+
+# Load environment variables
+load_dotenv()
+
+# Configure Gemini AI
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+model = genai.GenerativeModel('gemini-2.0-flash')
+
+SCAM_PATTERNS = {
+    'urgency': [r'təcili', r'dərhal', r'indi', r'bu gün', r'bu saat', r'tez', r'cəld'],
+    'money': [r'pul', r'ödəniş', r'kart', r'bank', r'kredit', r'borc', r'qaytarmaq', r'transfer', r'hesab'],
+    'threat': [r'həbs', r'cəza', r'qanun', r'polis', r'məhkəmə', r'şikayət', r'problem', r'təhlükə'],
+    'personal': [r'şəxsi məlumat', r'şifrə', r'pin', r'kart nömrəsi', r'hesab nömrəsi', r'şəxsiyyət']
+}
+
+class ScamAnalyzer:
+    def __init__(self):
+        self.text_analytics_client = TextAnalyticsClient(
+            endpoint=os.getenv("AZURE_LANGUAGE_ENDPOINT"),
+            credential=AzureKeyCredential(os.getenv("AZURE_LANGUAGE_KEY"))
+        )
+        self.conversation_history = []
+        self.scam_score = 0
+        self.conversation_start_time = datetime.now()
+        self.suspicious_entities = set()
+        self.risk_factors = {k: 0 for k in [
+            'urgency_level', 'threat_level', 'personal_info_request', 'financial_request', 'emotional_manipulation']}
+
+    def analyze_text(self, text, force_gemini=False):
+        self.conversation_history.append({'text': text, 'timestamp': datetime.now()})
+        documents = [text]
+
+        try:
+            pattern_matches = self._check_patterns(text)
+            lang = self.text_analytics_client.detect_language(documents=documents)[0]
+            poller = self.text_analytics_client.begin_analyze_actions(
+                documents=documents,
+                actions=[AnalyzeSentimentAction(), RecognizeEntitiesAction(), ExtractKeyPhrasesAction()],
+                show_stats=False
+            )
+
+            sentiment_result, entities_result, key_phrases_result = None, None, None
+            for action in poller.result():
+                for result in action:
+                    if result.is_error:
+                        continue
+                    if result.kind == "SentimentAnalysis":
+                        sentiment_result = result
+                    elif result.kind == "EntityRecognition":
+                        entities_result = result
+                    elif result.kind == "KeyPhraseExtraction":
+                        key_phrases_result = result
+
+            if not all([sentiment_result, entities_result, key_phrases_result]):
+                print("❌ Missing Azure analysis results")
+                return None
+
+            context = self._analyze_context(text, entities_result, key_phrases_result)
+            gemini_analysis = None
+
+            self._calculate_risk_factors(sentiment_result, pattern_matches, context, None, key_phrases_result, text)
+            scam_score = self._calculate_scam_score()
+            self.scam_score = scam_score
+
+            if force_gemini or scam_score >= 0.5:
+                def run_gemini():
+                    analysis = self._get_gemini_analysis(text, context)
+                    print("\n🤖 Gemini AI Analysis:")
+                    print(analysis)
+                threading.Thread(target=run_gemini).start()
+
+            return {
+                'text': text,
+                'scam_score': scam_score,
+                'risk_factors': self.risk_factors,
+                'context': context
+            }
+
+        except Exception as e:
+            print(f"❌ Exception in analyze_text: {e}")
+            return None
+
+    def _check_patterns(self, text):
+        matches = {}
+        for cat, patterns in SCAM_PATTERNS.items():
+            matches[cat] = [p for p in patterns if re.search(p, text.lower())]
+        return matches
+
+    def _analyze_context(self, text, entities, key_phrases):
+        context = {'suspicious_entities': [], 'time_pressure': False, 'authority_claim': False}
+        for ent in entities.entities:
+            if ent.category in ['Person', 'Organization', 'PhoneNumber']:
+                self.suspicious_entities.add(ent.text)
+                context['suspicious_entities'].append(ent.text)
+        for phrase in key_phrases.key_phrases:
+            if any(w in phrase.lower() for w in ['təcili', 'dərhal', 'tez']):
+                context['time_pressure'] = True
+            if any(w in phrase.lower() for w in ['polis', 'bank', 'məhkəmə']):
+                context['authority_claim'] = True
+        return context
+
+    def _calculate_risk_factors(self, sentiment, patterns, context, gemini, key_phrases, text):
+        self.risk_factors = {k: 0 for k in self.risk_factors}
+        text_lower = text.lower()
+
+        if context['time_pressure']:
+            self.risk_factors['urgency_level'] = 0.8
+        if patterns['threat']:
+            self.risk_factors['threat_level'] = 0.9
+        if patterns['personal']:
+            self.risk_factors['personal_info_request'] = 0.9
+        if patterns['money']:
+            self.risk_factors['financial_request'] = 0.9
+        if sentiment.sentiment == 'negative':
+            self.risk_factors['emotional_manipulation'] = 0.7
+            if sentiment.confidence_scores.negative > 0.8:
+                self.risk_factors['emotional_manipulation'] = 0.9
+
+        # ✅ Minimum baza riski əlavə et
+        if self.risk_factors['personal_info_request'] > 0 or self.risk_factors['financial_request'] > 0:
+            self.risk_factors['personal_info_request'] = max(self.risk_factors['personal_info_request'], 0.5)
+            self.risk_factors['financial_request'] = max(self.risk_factors['financial_request'], 0.5)
+
+        # ✅ Əlavə gücləndirilmiş risklər
+        if re.search(r'şifrə|pin|cvv|son istifadə tarixi|kart nömrəsi', text_lower):
+            self.risk_factors['personal_info_request'] = max(self.risk_factors['personal_info_request'], 0.9)
+
+        if re.search(r'kapital bank|paşa bank|bank respublika|leobank', text_lower):
+            self.risk_factors['financial_request'] = max(self.risk_factors['financial_request'], 0.9)
+
+        if 'kart' in text_lower and 'göndərin' in text_lower:
+            self.risk_factors['personal_info_request'] = max(self.risk_factors['personal_info_request'], 0.9)
+            self.risk_factors['financial_request'] = max(self.risk_factors['financial_request'], 0.9)
+
+    def _calculate_scam_score(self):
+        weights = {
+            'urgency_level': 0.25,
+            'threat_level': 0.25,
+            'personal_info_request': 0.2,
+            'financial_request': 0.2,
+            'emotional_manipulation': 0.1
+        }
+
+        # Kvadrat artırılmış risk dəyərləri ilə baza skor
+        base_score = sum((v ** 2) * weights[k] for k, v in self.risk_factors.items())
+
+        # Konversasiya qısa olduqda daha riskli say
+        duration = (datetime.now() - self.conversation_start_time).total_seconds()
+        time_factor = 1.2 if duration < 30 else 1.1 if duration < 60 else 1.0
+
+        # Şübhəli varlıqlar varsa artım
+        entity_factor = 1.0 + (len(self.suspicious_entities) * 0.1)
+
+        # Əlavə qoruyucu gücləndirmə:
+        # Əgər həm personal, həm də financial request ≥ 0.5 isə, bu artıq scam niyyəti göstəricisidir
+        risk_combined = self.risk_factors['personal_info_request'] + self.risk_factors['financial_request']
+        if risk_combined >= 1.5:
+            combined_boost = 1.5  # ciddi risk varsa daha da gücləndir
+        elif risk_combined >= 1.0:
+            combined_boost = 1.2
+        else:
+            combined_boost = 1.0
+
+        final_score = base_score * time_factor * entity_factor * combined_boost
+
+        return min(final_score, 1.0)
+
+    def _get_gemini_analysis(self, text, context):
+        convo = "\n".join(f"{e['timestamp'].strftime('%H:%M:%S')}: {e['text']}" for e in self.conversation_history[-5:])
+        prompt = f"""
+        Zəng konversasiyasını analiz et:
+        {convo}
+        Son mesaj: {text}
+        - Şübhəli varlıqlar: {', '.join(context['suspicious_entities'])}
+        - Təciliyyət: {context['time_pressure']}
+        - Səlahiyyət iddiası: {context['authority_claim']}
+        Cavabı qısa və başa düşülən et.
+        """
+        return model.generate_content(prompt).text
+
+# ----------------------
+# Real-time voice input
+# ----------------------
+def main():
+    required = ["AZURE_SPEECH_KEY", "AZURE_SPEECH_REGION", "AZURE_LANGUAGE_KEY", "AZURE_LANGUAGE_ENDPOINT", "GOOGLE_API_KEY"]
+    if not all(os.getenv(k) for k in required):
+        print("⚠️ Ətraf mühit dəyişənləri tapılmadı!")
+        return
+
+    speech_config = speechsdk.SpeechConfig(subscription=os.getenv("AZURE_SPEECH_KEY"), region=os.getenv("AZURE_SPEECH_REGION"))
+    speech_config.speech_recognition_language = "az-AZ"
+    audio_config = speechsdk.audio.AudioConfig(use_default_microphone=True)
+    recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config)
+
+    analyzer = ScamAnalyzer()
+    print("🎤 Dinləyirəm... (Dayandırmaq üçün Ctrl+C və ya Enter)")
+
+    def handle_result(evt):
+        text = evt.result.text.strip()
+        if len(text.split()) < 3:
+            return
+        print(f"\n📝 Tanınan mətn: {text}")
+        result = analyzer.analyze_text(text)
+        if result:
+            print("Scam Score:", result['scam_score'])
+
+    def handle_canceled(evt):
+        print(f"❌ Tanıma ləğv edildi: {evt.result.reason}")
+
+    recognizer.recognized.connect(handle_result)
+    recognizer.canceled.connect(handle_canceled)
+    recognizer.start_continuous_recognition()
+
+    try:
+        input("\nEnter basın proqramı dayandırmaq üçün...\n")
+    except KeyboardInterrupt:
+        pass
+    recognizer.stop_continuous_recognition()
+    print("🔚 Proqram dayandırıldı")
+
+if __name__ == "__main__":
+    main()

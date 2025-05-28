@@ -1,0 +1,138 @@
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional, Dict, Any, List
+import uvicorn
+from speech_to_text import ScamAnalyzer
+import json
+import asyncio
+import azure.cognitiveservices.speech as speechsdk
+import os
+from dotenv import load_dotenv
+from datetime import datetime
+
+# Load environment variables
+load_dotenv()
+
+app = FastAPI(title="Scam Call Detection API")
+
+# Enable CORS for mobile app
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, replace with your mobile app's domain
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize the analyzer
+analyzer = ScamAnalyzer()
+
+class TextAnalysisRequest(BaseModel):
+    text: str
+    force_gemini: Optional[bool] = False
+
+class AnalysisResponse(BaseModel):
+    text: str
+    scam_score: float
+    risk_factors: Dict[str, float]
+    context: Dict[str, Any]
+
+class ConversationHistory(BaseModel):
+    messages: List[Dict[str, Any]]
+
+@app.post("/analyze", response_model=AnalysisResponse)
+async def analyze_text(request: TextAnalysisRequest):
+    try:
+        result = analyzer.analyze_text(request.text, request.force_gemini)
+        if result is None:
+            raise HTTPException(status_code=500, detail="Analysis failed")
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/conversation-history", response_model=ConversationHistory)
+async def get_conversation_history():
+    try:
+        return {"messages": analyzer.conversation_history}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/reset-conversation")
+async def reset_conversation():
+    try:
+        analyzer.conversation_history = []
+        analyzer.scam_score = 0
+        analyzer.conversation_start_time = datetime.now()
+        analyzer.suspicious_entities = set()
+        analyzer.risk_factors = {k: 0 for k in [
+            'urgency_level', 'threat_level', 'personal_info_request', 
+            'financial_request', 'emotional_manipulation']}
+        return {"status": "success", "message": "Conversation reset successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy"}
+
+# WebSocket connection for real-time voice analysis
+@app.websocket("/ws/voice")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    
+    try:
+        # Configure speech recognition
+        speech_config = speechsdk.SpeechConfig(
+            subscription=os.getenv("AZURE_SPEECH_KEY"), 
+            region=os.getenv("AZURE_SPEECH_REGION")
+        )
+        speech_config.speech_recognition_language = "az-AZ"
+        
+        # Create audio config from stream
+        audio_config = speechsdk.audio.AudioConfig(use_default_microphone=True)
+        recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config)
+
+        def handle_result(evt):
+            text = evt.result.text.strip()
+            if len(text.split()) < 3:
+                return
+            
+            result = analyzer.analyze_text(text)
+            if result:
+                asyncio.create_task(websocket.send_json({
+                    "type": "analysis",
+                    "data": result
+                }))
+
+        def handle_canceled(evt):
+            asyncio.create_task(websocket.send_json({
+                "type": "error",
+                "message": f"Recognition canceled: {evt.result.reason}"
+            }))
+
+        recognizer.recognized.connect(handle_result)
+        recognizer.canceled.connect(handle_canceled)
+        recognizer.start_continuous_recognition()
+
+        # Keep connection alive and handle client messages
+        while True:
+            try:
+                data = await websocket.receive_text()
+                if data == "stop":
+                    recognizer.stop_continuous_recognition()
+                    break
+            except WebSocketDisconnect:
+                recognizer.stop_continuous_recognition()
+                break
+
+    except Exception as e:
+        await websocket.send_json({
+            "type": "error",
+            "message": str(e)
+        })
+    finally:
+        await websocket.close()
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000) 
