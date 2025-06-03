@@ -13,6 +13,33 @@ Real-time zəng analizi və scam aşkarlama sistemi. Bu proqram sizin zəngləri
   - Gemini AI inteqrasiyası
 - Avtomatik risk skorlaması
 - Adaptiv öyrənmə sistemi
+- Modulyar və genişlənə bilən arxitektura
+
+## Layihə Strukturu 🗂️
+
+```
+scam-call-detector/
+├── src/
+│   ├── analyzers/         # AI və qayda əsaslı analiz modulları
+│   │   ├── scam_analyzer.py
+│   │   └── gemini_analyzer.py
+│   ├── models/            # ML model və vektorlaşdırıcı
+│   │   └── ml_detector.py
+│   ├── utils/             # Konfiqurasiya və sabitlər
+│   │   └── config.py
+│   ├── api/               # (Opsional) API endpointləri
+│   └── speech_to_text.py  # Əsas tətbiq (main entrypoint)
+├── requirements.txt
+├── .env
+└── README.md
+```
+
+### Əsas Modullar
+- **src/speech_to_text.py**: Səsli giriş və real-time analiz üçün əsas tətbiq.
+- **src/analyzers/scam_analyzer.py**: Scam aşkarlama və risk hesablaması (Azure, qayda və ML əsaslı).
+- **src/analyzers/gemini_analyzer.py**: Gemini AI ilə dərin təhlil.
+- **src/models/ml_detector.py**: ML modelinin yaradılması, saxlanması və proqnozlaşdırılması.
+- **src/utils/config.py**: Konfiqurasiya və sabitlər.
 
 ## Tələblər 📋
 
@@ -56,7 +83,7 @@ GOOGLE_API_KEY=your_gemini_api_key
 
 Proqramı başlatmaq üçün:
 ```bash
-python speech_to_text.py
+python -m src.speech_to_text
 ```
 
 Proqram başladıqdan sonra:
@@ -101,7 +128,7 @@ MIT Lisenziyası - daha ətraflı məlumat üçün [LICENSE](LICENSE) faylına b
 Problemlər və təkliflər üçün:
 1. Issue yaradın
 2. Pull request göndərin
-3. Email: your.email@example.com
+3. Email: meherrem.davudov@gmail.com
 
 ## Təşəkkür 🙏
 

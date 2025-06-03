@@ -1,0 +1,3 @@
+"""
+Scam analyzers package
+""" 
